@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-
 SITE_URL="https://chaturbate.com/monika_reed1/"
 OUT_DIR="${1:-$(pwd)}"
 mkdir -p "$OUT_DIR"
