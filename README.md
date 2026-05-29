@@ -1,23 +1,25 @@
 # fred
 
-Downloads HLS streams from Chaturbate with video and audio separated, then muxes them together.
+`download_chaturbate_hls.sh` is a Chaturbate live recorder/uploader that keeps HLS URL resolution via `torsocks` while recording to MPEG-TS segments and uploading them via `rclone`.
 
 ## Usage
 
 ```bash
-./download_chaturbate_hls.sh [output_directory]
+./download_chaturbate_hls.sh <Chaturbate URL or model name>
 ```
-
-- `output_directory` (optional): Where to save the downloaded streams. Defaults to current directory.
 
 ## Features
 
-- Downloads video stream at 480p resolution
-- Downloads audio stream separately
-- Uses `torsocks` for anonymity
-- Outputs: `stream_video.mp4` and `stream_audio.m4a`
+- Uses `torsocks` for `yt-dlp` HLS URL extraction
+- Records live streams into `.ts` segments with `ffmpeg`
+- Uploads segments to remote storage via `rclone`
+- Supports per-model locking, retry logic, remote failover, and upload counters
 
 ## Requirements
 
 - `yt-dlp`
-- `torsocks` (optional, for Tor routing)
+- `torsocks`
+- `ffmpeg`
+- `ffprobe`
+- `rclone`
+- `flock`

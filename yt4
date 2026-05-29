@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# yt4 — hardened live recorder/uploader
+# - Preserves original behaviour (ffmpeg -> segments -> rclone uploads)
+# - Reads UPLOADER and DEFAULT_REMOTE from bin/uploader.txt
+# - Uses MPEG-TS segments for better live-stream reliability
+# - Retries yt-dlp URL extraction
+# - Adds per-model flock lock to avoid duplicate same-model runs
+# - Logs ffmpeg exit details
+# - Keeps notifications, retries, counters, remote rotation, DONE_SIGNAL
+# - Restarts capture if the same newest segment stays active for more than 65 seconds
+# - Refreshes stream URLs immediately before ffmpeg starts to avoid 403 expiry
+# - Records explicit stop reasons when capture is terminated
+# - Segments are stored as .ts
 
-# download_chaturbate_hls.sh — live recorder/uploader using torsocks for yt-dlp HLS URL extraction
-# Keeps HLS URL resolution via torsocks while adding yt4-style segmented capture and upload.
+set -u
+set -o pipefail
 
+# -----------------------------
+# Configuration
+# -----------------------------
 OFFLINE_MAX_WAIT=600
-RETRY_DELAY=10
+RETRY_DELAY=1.5
 TOPIC="yt-dlp-notify"
 FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
 BACKUP_REMOTES=(gd31 gd32 gd33 gd34 gd35)
@@ -18,11 +32,21 @@ COUNTER_REMOTE="${COUNTER_REMOTE:-gdrive:yt4_counts}"
 COUNTER_DIR="${COUNTER_DIR:-$HOME/.yt4_counts}"
 GET_URL_MAX_TRIES=5
 GET_URL_RETRY_DELAY=5
+
+# Restart capture if the same newest segment stays active longer than this.
 SEGMENT_STALL_TIMEOUT=75
 SEGMENT_CHECK_INTERVAL=2
+
+# Directory for segments (unique per PID)
 SEGMENT_DIR="/tmp/stream_segments_$$"
+
+# Stop reason file (unique per process, inherited by background subshells)
 STOP_REASON_FILE=""
 
+# Prefer your ffmpeg first
+export PATH="$HOME/program/ffmpeg-n6.1.1-1-g61b88b4dda-linux64-gpl-6.1/bin/:$PATH"
+
+# Read uploader + default remote from bin/uploader.txt
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 UPLOADER_FILE="$SCRIPT_DIR/uploader.txt"
 
@@ -35,6 +59,9 @@ else
     DEFAULT_REMOTE="${DEFAULT_REMOTE:-gd1}"
 fi
 
+# -----------------------------
+# Helper functions
+# -----------------------------
 log_ts() {
     TZ="Asia/Manila" date '+%Y-%m-%d %H:%M:%S'
 }
@@ -58,8 +85,15 @@ clear_stop_reason() {
     fi
 }
 
+stop_capture() {
+    local reason="$1"
+    set_stop_reason "$reason"
+    echo "$(log_ts) 🛑 Stopping FFmpeg: $reason"
+    kill -TERM "$CAPTURE_PID" 2>/dev/null || true
+}
+
 infer_stop_reason_from_ffmpeg_log() {
-    if [[ -f /tmp/ffmpeg.log ]]; then
+    if [ -f /tmp/ffmpeg.log ]; then
         if grep -q "HTTP error 403 Forbidden" /tmp/ffmpeg.log 2>/dev/null; then
             echo "ffmpeg_http_403_forbidden"
             return 0
@@ -87,7 +121,7 @@ build_remotes_list() {
             remotes_list+=("$r")
         fi
     done
-    if [[ ${#remotes_list[@]} -eq 0 ]]; then
+    if [ "${#remotes_list[@]}" -eq 0 ]; then
         remotes_list+=("$REMOTE")
     fi
     current_remote_index=0
@@ -126,10 +160,10 @@ get_stream_urls() {
     local tries=0
     while (( tries < GET_URL_MAX_TRIES )); do
         mapfile -t M3U8_URLS < <(
-            torsocks -i yt-dlp --get-url -f "$FORMAT" "$URL" 2>/dev/null | awk 'NF { print $1 }'
+            yt-dlp --get-url -f "$FORMAT" "$URL" 2>/dev/null | awk 'NF { print $1 }'
         )
 
-        if [[ ${#M3U8_URLS[@]} -ge 1 ]]; then
+        if [ "${#M3U8_URLS[@]}" -ge 1 ]; then
             echo "$(log_ts) ✅ Got ${#M3U8_URLS[@]} stream URL(s)"
             return 0
         fi
@@ -151,19 +185,22 @@ watch_same_segment_runtime() {
         sleep "$SEGMENT_CHECK_INTERVAL"
         now=$SECONDS
 
-        newest_file=$(ls -1t "$SEGMENT_DIR"/segment_*.ts 2>/dev/null | head -n 1 || true)
-        if [[ -z "$newest_file" ]]; then
+        newest_file=$(
+            ls -1t "$SEGMENT_DIR"/segment_*.ts 2>/dev/null | head -n 1
+        )
+
+        if [ -z "$newest_file" ]; then
             continue
         fi
 
-        if [[ "$newest_file" != "$current_file" ]]; then
+        if [ "$newest_file" != "$current_file" ]; then
             current_file="$newest_file"
             current_since=$now
             echo "$(log_ts) ℹ️ Active segment is now: $(basename "$current_file")"
             continue
         fi
 
-        if (( now - current_since >= SEGMENT_STALL_TIMEOUT )); then
+        if [ $((now - current_since)) -ge "$SEGMENT_STALL_TIMEOUT" ]; then
             echo "$(log_ts) ⚠️ Active segment has been the same for >${SEGMENT_STALL_TIMEOUT}s: $(basename "$current_file")"
             stop_capture "same_segment_active_too_long:$(basename "$current_file")"
             return 1
@@ -175,7 +212,7 @@ watch_same_segment_runtime() {
 
 upload_segment() {
     local segment_file="$1"
-    if ! [[ -f "$segment_file" ]]; then
+    if ! [ -f "$segment_file" ]; then
         return
     fi
 
@@ -205,9 +242,10 @@ upload_segment() {
         printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
         tail -n 20 "$rclone_output" | sed 's/^/    /'
         curl -s -d "$(log_ts) ❌ Segment upload failed: $FOLDER/$remote_segment (remote: $REMOTE). rclone exit $rcode" "https://ntfy.sh/$TOPIC" >/dev/null 2>&1 || true
+
         UPLOAD_FAIL_COUNT=$((UPLOAD_FAIL_COUNT + 1))
         echo "$(log_ts) ⚠️ Consecutive upload failures: $UPLOAD_FAIL_COUNT/${MAX_UPLOAD_FAILS_BEFORE_SWITCH}"
-        if [[ "$UPLOAD_FAIL_COUNT" -ge "$MAX_UPLOAD_FAILS_BEFORE_SWITCH" ]]; then
+        if [ "$UPLOAD_FAIL_COUNT" -ge "$MAX_UPLOAD_FAILS_BEFORE_SWITCH" ]; then
             switch_remote
         fi
     fi
@@ -215,33 +253,26 @@ upload_segment() {
     rm -f "$rclone_output" 2>/dev/null || true
 }
 
-stop_capture() {
-    local reason="$1"
-    set_stop_reason "$reason"
-    echo "$(log_ts) 🛑 Stopping FFmpeg: $reason"
-    kill -TERM "$CAPTURE_PID" 2>/dev/null || true
-}
-
 cleanup() {
     echo "$(log_ts) 🛑 Received interrupt, finalizing segments and uploading..."
     printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
 
-    if [[ -n "${SEGMENT_WATCHER_PID:-}" ]]; then
+    if [ -n "${SEGMENT_WATCHER_PID:-}" ]; then
         kill -TERM "$SEGMENT_WATCHER_PID" 2>/dev/null || true
         wait "$SEGMENT_WATCHER_PID" 2>/dev/null || true
     fi
 
-    if [[ -n "${CAPTURE_PID:-}" ]]; then
+    if [ -n "${CAPTURE_PID:-}" ]; then
         kill -TERM "$CAPTURE_PID" 2>/dev/null || true
         wait "$CAPTURE_PID" 2>/dev/null || true
     fi
 
-    if [[ -f "/tmp/ffmpeg.log" ]]; then
+    if [ -f /tmp/ffmpeg.log ]; then
         echo "$(log_ts) ℹ️ Last ffmpeg log lines:"
         tail -n 30 /tmp/ffmpeg.log | sed 's/^/    /'
     fi
 
-    if [[ -d "$SEGMENT_DIR" ]]; then
+    if [ -d "$SEGMENT_DIR" ]; then
         shopt -s nullglob
         for segment in "$SEGMENT_DIR"/segment_*.ts; do
             upload_segment "$segment"
@@ -250,7 +281,7 @@ cleanup() {
         rm -rf "$SEGMENT_DIR"
     fi
 
-    if [[ -n "${STOP_REASON_FILE:-}" ]]; then
+    if [ -n "${STOP_REASON_FILE:-}" ]; then
         rm -f "$STOP_REASON_FILE" 2>/dev/null || true
     fi
 
@@ -260,13 +291,14 @@ cleanup() {
 }
 
 run_capture() {
+    # Refresh URLs immediately before ffmpeg starts to avoid stale 403 URLs.
     if ! get_stream_urls; then
         set_stop_reason "url_refresh_failed_before_ffmpeg"
         echo "$(log_ts) ❌ Could not refresh stream URLs before ffmpeg start."
         return 8
     fi
 
-    if [[ ${#M3U8_URLS[@]} -ge 2 ]]; then
+    if [ "${#M3U8_URLS[@]}" -ge 2 ]; then
         VIDEO_URL="${M3U8_URLS[0]}"
         AUDIO_URL="${M3U8_URLS[1]}"
 
@@ -324,26 +356,31 @@ run_capture() {
     fi
 }
 
+# -----------------------------
+# Start script
+# -----------------------------
 trap cleanup SIGINT SIGTERM
 
-for cmd in ffmpeg ffprobe yt-dlp curl rclone flock torsocks; do
+# Ensure required commands exist
+for cmd in ffmpeg ffprobe yt-dlp curl rclone flock; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "$(log_ts) ❌ ERROR: '$cmd' is not installed or not in PATH"
         exit 1
     fi
 done
 
-if [[ $# -lt 1 ]]; then
-    echo "$(log_ts) ❗ Usage: $0 <Chaturbate URL or model name>"
+if [ $# -lt 1 ]; then
+    echo "$(log_ts) ❗ Usage: $0 <Chaturbate URL>  OR  $0 <model_name>  OR  $0 <model_name_gd2>"
     exit 1
 fi
 
 INPUT="$1"
 
+# Determine if input is a full URL or a model spec (allowing remote suffix like _gd36)
 if [[ "$INPUT" =~ :// ]] || [[ "$INPUT" == *"chaturbate.com"* ]]; then
     URL="$INPUT"
     MODEL=$(echo "$URL" | sed -E 's|.*chaturbate\.com/([^/]+)/?$|\1|')
-    if [[ -z "$MODEL" ]]; then
+    if [ -z "$MODEL" ]; then
         echo "$(log_ts) ❌ ERROR: Could not extract model name from URL"
         exit 1
     fi
@@ -362,35 +399,43 @@ else
     URL="https://chaturbate.com/${MODEL}/"
 fi
 
+# Per-model lock
 LOCK_FILE="/tmp/yt4_${MODEL}.lock"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-    echo "$(log_ts) ❌ Another instance is already running for $MODEL"
+    echo "$(log_ts) ❌ Another yt4 instance is already running for $MODEL"
     exit 1
 fi
 
+# Initialize stop reason file after MODEL is known
 STOP_REASON_FILE="/tmp/yt4_${MODEL}_stop_reason_$$"
 : > "$STOP_REASON_FILE" 2>/dev/null || true
 
+# user-visible banner
 echo "....................${MODEL}...................."
 
+# runtime state variables
 offline_start=""
 ERROR_COUNT=0
 UPLOAD_FAIL_COUNT=0
 REMOTE="${REMOTE:-$DEFAULT_REMOTE}"
 
+# Prepare counters directory and read local/remote counters
 mkdir -p "$COUNTER_DIR"
 COUNTER_FILE="$COUNTER_DIR/${MODEL}.txt"
-if [[ -f "$COUNTER_FILE" ]]; then
+
+if [ -f "$COUNTER_FILE" ]; then
     local_val=$(<"$COUNTER_FILE")
 else
     local_val=0
 fi
 remote_val=$(get_remote_counter "$MODEL")
+
+# normalize
 if ! [[ "$local_val" =~ ^[0-9]+$ ]]; then local_val=0; fi
 if ! [[ "$remote_val" =~ ^[0-9]+$ ]]; then remote_val=0; fi
 
-if [[ "$remote_val" -gt "$local_val" ]]; then
+if [ "$remote_val" -gt "$local_val" ]; then
     folder_count="$remote_val"
     echo "$(log_ts) ℹ️ Using higher remote counter for $MODEL: $folder_count (local: $local_val)"
 else
@@ -400,36 +445,42 @@ fi
 
 build_remotes_list
 
+# Main loop
 while true; do
     printf "\n\033[1;36m═════════════════════════════════════════════════════════\033[0m\n"
     echo "$(log_ts) 🔍 Checking stream status..."
     printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
 
-    CHECK_OUTPUT=$(torsocks -i yt-dlp --simulate -f "$FORMAT" "$URL" 2>&1 || true)
+    CHECK_OUTPUT=$(yt-dlp --simulate -f "$FORMAT" "$URL" 2>&1)
     STATUS=$?
 
-    if [[ $STATUS -eq 0 ]]; then
+    if [ $STATUS -eq 0 ]; then
         ERROR_COUNT=0
         offline_start=""
         clear_stop_reason
         echo "$(log_ts) 📡 Stream is LIVE — starting streaming..."
         printf "\033[1;32m══════════════════════════════════════════════════════\033[0m\n"
 
+        # Atomic-ish counter claim
         attempts=0
         max_attempts=8
         while true; do
             attempts=$((attempts + 1))
+
             remote_now=$(get_remote_counter "$MODEL")
             if ! [[ "$remote_now" =~ ^[0-9]+$ ]]; then remote_now=0; fi
+
             candidate=$((remote_now + 1))
-            if [[ "$candidate" -le "$folder_count" ]]; then
+            if [ "$candidate" -le "$folder_count" ]; then
                 candidate=$((folder_count + 1))
             fi
+
             tmpf=$(mktemp) || tmpf="/tmp/yt4_counter_${MODEL}_$$"
             printf "%d" "$candidate" > "$tmpf"
+
             if rclone copyto "$tmpf" "${COUNTER_REMOTE}/${MODEL}.txt" --no-traverse 2>/tmp/rclone_counter_err.log; then
                 remote_verify=$(get_remote_counter "$MODEL")
-                if [[ "$remote_verify" -eq "$candidate" ]]; then
+                if [ "$remote_verify" -eq "$candidate" ]; then
                     folder_count="$candidate"
                     printf "%d" "$folder_count" > "$COUNTER_FILE"
                     echo "$(log_ts) ✅ Claimed counter $folder_count for $MODEL (attempt $attempts)."
@@ -441,17 +492,21 @@ while true; do
             else
                 echo "$(log_ts) ⚠️ rclone failed to write remote counter (attempt $attempts). See /tmp/rclone_counter_err.log"
             fi
+
             rm -f "$tmpf" 2>/dev/null || true
-            if [[ $attempts -ge $max_attempts ]]; then
+
+            if [ $attempts -ge $max_attempts ]; then
                 echo "$(log_ts) ❌ Failed to claim counter after $attempts attempts — falling back to remote value $remote_now."
                 folder_count="$remote_now"
                 printf "%d" "$folder_count" > "$COUNTER_FILE"
                 break
             fi
+
             sleep $(( (RANDOM % 3) + 1 ))
         done
 
         echo "$(log_ts) 📦 Current session count for $MODEL: $folder_count"
+
         folder_ts=$(TZ="Asia/Manila" date +"%Y-%m-%d_%H_%M")
         FOLDER="$BASE_FOLDER/$MODEL/${UPLOADER:+${UPLOADER}_}${MODEL}_${folder_ts}"
 
@@ -463,6 +518,8 @@ while true; do
         rm -f /tmp/ffmpeg.log
         SEGMENT_PREFIX="$SEGMENT_DIR/segment_%03d.ts"
 
+        restart_capture=0
+
         run_capture &
         CAPTURE_PID=$!
 
@@ -471,10 +528,13 @@ while true; do
 
         while kill -0 "$CAPTURE_PID" 2>/dev/null; do
             sleep "$BUFFER_FLUSH_INTERVAL"
+
             shopt -s nullglob
             segment_files=("$SEGMENT_DIR"/segment_*.ts)
             shopt -u nullglob
-            if [[ ${#segment_files[@]} -gt 1 ]]; then
+
+            # Keep newest file locally; upload only older finalized files.
+            if [ "${#segment_files[@]}" -gt 1 ]; then
                 num_to_upload=$((${#segment_files[@]} - 1))
                 for (( i=0; i<num_to_upload; i++ )); do
                     upload_segment "${segment_files[i]}"
@@ -482,7 +542,7 @@ while true; do
             fi
         done
 
-        if [[ -n "${SEGMENT_WATCHER_PID:-}" ]]; then
+        if [ -n "${SEGMENT_WATCHER_PID:-}" ]; then
             kill -TERM "$SEGMENT_WATCHER_PID" 2>/dev/null || true
             wait "$SEGMENT_WATCHER_PID" 2>/dev/null || true
         fi
@@ -491,9 +551,9 @@ while true; do
         CAPTURE_EXIT=$?
 
         stop_reason="$(get_stop_reason)"
-        if [[ -z "$stop_reason" && "$CAPTURE_EXIT" -eq 8 ]]; then
+        if [ -z "$stop_reason" ] && [ "$CAPTURE_EXIT" -eq 8 ]; then
             stop_reason="$(infer_stop_reason_from_ffmpeg_log || true)"
-            if [[ -n "$stop_reason" ]]; then
+            if [ -n "$stop_reason" ]; then
                 set_stop_reason "$stop_reason"
             fi
         fi
@@ -501,7 +561,7 @@ while true; do
         echo "$(log_ts) ℹ️ ffmpeg/yt-dlp pipeline exited with code: $CAPTURE_EXIT"
         echo "$(log_ts) ℹ️ Stop reason: ${stop_reason:-unknown}"
 
-        if [[ -f /tmp/ffmpeg.log ]]; then
+        if [ -f /tmp/ffmpeg.log ]; then
             echo "$(log_ts) ℹ️ Last ffmpeg log lines:"
             tail -n 30 /tmp/ffmpeg.log | sed 's/^/    /'
         fi
@@ -522,7 +582,7 @@ while true; do
             continue
         fi
 
-        if [[ "$CAPTURE_EXIT" -eq 8 ]] || [[ "${stop_reason:-}" == url_refresh_failed_before_ffmpeg ]]; then
+        if [ "$CAPTURE_EXIT" -eq 8 ] || [[ "${stop_reason:-}" == url_refresh_failed_before_ffmpeg ]]; then
             echo "$(log_ts) 🔁 Capture will restart (reason: ${stop_reason:-unknown})."
             printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
             sleep 2
@@ -538,7 +598,7 @@ while true; do
 
     elif echo "$CHECK_OUTPUT" | grep -q "Room is currently offline"; then
         now=$SECONDS
-        if [[ -z "$offline_start" ]]; then
+        if [ -z "$offline_start" ]; then
             offline_start=$now
             echo "$(log_ts) ⚠️ Model is offline — starting offline timer."
             printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
@@ -546,7 +606,7 @@ while true; do
             elapsed=$(( now - offline_start ))
             echo "$(log_ts) ⏳ Still offline for ${elapsed}s"
             printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
-            if [[ "$elapsed" -ge "$OFFLINE_MAX_WAIT" ]]; then
+            if [ "$elapsed" -ge "$OFFLINE_MAX_WAIT" ]; then
                 printf "══════════════════════════════════════════════════════\n"
                 echo "$(log_ts) ❌ Offline too long (${OFFLINE_MAX_WAIT}s) — stopping."
                 printf "══════════════════════════════════════════════════════\n"
@@ -565,7 +625,7 @@ while true; do
         ERROR_COUNT=$((ERROR_COUNT + 1))
         echo "$(log_ts) ⚠️ Stream ended or unavailable (404 Not Found). Retrying. (error attempt $ERROR_COUNT/${MAX_ERROR_RETRIES})"
         printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
-        if [[ "$ERROR_COUNT" -ge "$MAX_ERROR_RETRIES" ]]; then
+        if [ "$ERROR_COUNT" -ge "$MAX_ERROR_RETRIES" ]; then
             echo "$(log_ts) ❌ Too many errors ($ERROR_COUNT). Stopping."
             printf "\033[1;31m══════════════════════════════════════════════════════\033[0m\n"
             echo "[DONE_SIGNAL]"
@@ -579,7 +639,7 @@ while true; do
         echo "$(log_ts) ⚠️ Temporary error (e.g., timeout, bad gateway, or 403). Retrying. (error attempt $ERROR_COUNT/${MAX_ERROR_RETRIES})"
         printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
         curl -s -d "$(log_ts) ⚠️ Temporary error while checking $URL (remote: $REMOTE) — attempt $ERROR_COUNT/${MAX_ERROR_RETRIES}" "https://ntfy.sh/$TOPIC" >/dev/null 2>&1 || true
-        if [[ "$ERROR_COUNT" -ge "$MAX_ERROR_RETRIES" ]]; then
+        if [ "$ERROR_COUNT" -ge "$MAX_ERROR_RETRIES" ]; then
             echo "$(log_ts) ❌ Too many errors ($ERROR_COUNT). Stopping."
             printf "\033[1;31m══════════════════════════════════════════════════════\033[0m\n"
             echo "[DONE_SIGNAL]"
@@ -590,17 +650,22 @@ while true; do
 
     else
         ERROR_COUNT=$((ERROR_COUNT + 1))
-        echo "$(log_ts) ⚠️ Unexpected response while checking stream. Retrying. (error attempt $ERROR_COUNT/${MAX_ERROR_RETRIES})"
+        echo "$(log_ts) 🚨 Unknown error during check (attempt $ERROR_COUNT/${MAX_ERROR_RETRIES}):"
+        echo "$CHECK_OUTPUT"
         printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
-        if [[ "$ERROR_COUNT" -ge "$MAX_ERROR_RETRIES" ]]; then
-            echo "$(log_ts) ❌ Too many errors ($ERROR_COUNT). Stopping."
+        curl -s -d "$(log_ts) 🚨 Unknown failure while checking $URL (remote: $REMOTE) — attempt $ERROR_COUNT/${MAX_ERROR_RETRIES}" "https://ntfy.sh/$TOPIC" >/dev/null 2>&1 || true
+        if [ "$ERROR_COUNT" -ge "$MAX_ERROR_RETRIES" ]; then
+            echo "$(log_ts) ❌ Too many unknown/errors ($ERROR_COUNT). Stopping."
             printf "\033[1;31m══════════════════════════════════════════════════════\033[0m\n"
             echo "[DONE_SIGNAL]"
-            curl -s -d "$(log_ts) ❌ Stopped: Too many errors ($ERROR_COUNT) for $URL (remote: $REMOTE)" "https://ntfy.sh/$TOPIC" >/dev/null 2>&1 || true
+            curl -s -d "$(log_ts) ❌ Stopped: Too many unknown/errors ($ERROR_COUNT) for $URL (remote: $REMOTE)" "https://ntfy.sh/$TOPIC" >/dev/null 2>&1 || true
             rm -f "$STOP_REASON_FILE" 2>/dev/null || true
             exit 1
         fi
     fi
 
+    echo "$(log_ts) 🔁 Checking again in ${RETRY_DELAY}s..."
+    printf "\033[1;35m═════════════════════════════════════════════════════════\033[0m\n"
+    printf "\033[1;46m═════════════════════════════════════════════════════════\033[0m"
     sleep "$RETRY_DELAY"
 done
