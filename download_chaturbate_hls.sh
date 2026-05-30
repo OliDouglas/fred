@@ -260,11 +260,23 @@ cleanup() {
 }
 
 run_capture() {
-    if ! get_stream_urls; then
-        set_stop_reason "url_refresh_failed_before_ffmpeg"
-        echo "$(log_ts) ❌ Could not refresh stream URLs before ffmpeg start."
-        return 8
-    fi
+    local url_attempts=0
+    local url_max_attempts=3
+    
+    while (( url_attempts < url_max_attempts )); do
+        if get_stream_urls; then
+            break
+        fi
+        url_attempts=$((url_attempts + 1))
+        if (( url_attempts < url_max_attempts )); then
+            echo "$(log_ts) ⚠️ Failed to get stream URLs (attempt $url_attempts/$url_max_attempts), retrying in 5s..."
+            sleep 5
+        else
+            set_stop_reason "url_refresh_failed_before_ffmpeg"
+            echo "$(log_ts) ❌ Could not refresh stream URLs after $url_attempts attempts. Returning to main loop."
+            return 0
+        fi
+    done
 
     if [[ ${#M3U8_URLS[@]} -ge 2 ]]; then
         VIDEO_URL="${M3U8_URLS[0]}"
@@ -326,12 +338,53 @@ run_capture() {
 
 trap cleanup SIGINT SIGTERM
 
-for cmd in ffmpeg ffprobe yt-dlp curl rclone flock torsocks; do
+for cmd in ffmpeg ffprobe yt-dlp curl rclone flock torsocks tor; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "$(log_ts) ❌ ERROR: '$cmd' is not installed or not in PATH"
         exit 1
     fi
 done
+
+ensure_tor_running() {
+    if pgrep -x tor >/dev/null 2>&1; then
+        echo "$(log_ts) ✅ Tor process already running."
+        return 0
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet tor; then
+        echo "$(log_ts) ✅ Tor service is active."
+        return 0
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        echo "$(log_ts) 🔄 Attempting to start tor service via systemctl..."
+        if systemctl start tor 2>/dev/null; then
+            sleep 2
+            if pgrep -x tor >/dev/null 2>&1; then
+                echo "$(log_ts) ✅ Tor service started successfully."
+                return 0
+            fi
+        fi
+        echo "$(log_ts) ⚠️ Failed to start tor service via systemctl."
+    fi
+
+    echo "$(log_ts) 🔄 Launching tor in the background..."
+    tor -f /etc/tor/torrc >/tmp/tor_start.log 2>&1 &
+    TOR_BG_PID=$!
+
+    for i in {1..10}; do
+        if pgrep -x tor >/dev/null 2>&1; then
+            echo "$(log_ts) ✅ Tor started in the background."
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "$(log_ts) ❌ Tor failed to start in the background after 10 seconds. See /tmp/tor_start.log."
+    return 1
+}
+
+ensure_tor_running || exit 1
 
 if [[ $# -lt 1 ]]; then
     echo "$(log_ts) ❗ Usage: $0 <Chaturbate URL or model name>"
@@ -405,10 +458,25 @@ while true; do
     echo "$(log_ts) 🔍 Checking stream status..."
     printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
 
-    CHECK_OUTPUT=$(torsocks -i yt-dlp --simulate -f "$FORMAT" "$URL" 2>&1 || true)
+    CHECK_OUTPUT=$(torsocks -i yt-dlp --simulate -f "$FORMAT" "$URL" 2>&1)
     STATUS=$?
 
-    if [[ $STATUS -eq 0 ]]; then
+    if [[ $STATUS -ne 0 ]]; then
+        ERROR_COUNT=$((ERROR_COUNT + 1))
+        echo "$(log_ts) ⚠️ Torsocks/yt-dlp check failed (exit $STATUS). Retrying. (error attempt $ERROR_COUNT/${MAX_ERROR_RETRIES})"
+        printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
+        curl -s -d "$(log_ts) ⚠️ Torsocks connection or yt-dlp check failed for $URL (remote: $REMOTE) — attempt $ERROR_COUNT/${MAX_ERROR_RETRIES}" "https://ntfy.sh/$TOPIC" >/dev/null 2>&1 || true
+        if [[ "$ERROR_COUNT" -ge "$MAX_ERROR_RETRIES" ]]; then
+            echo "$(log_ts) ❌ Too many errors ($ERROR_COUNT). Stopping."
+            printf "\033[1;31m══════════════════════════════════════════════════════\033[0m\n"
+            echo "[DONE_SIGNAL]"
+            curl -s -d "$(log_ts) ❌ Stopped: Too many torsocks/yt-dlp errors ($ERROR_COUNT) for $URL (remote: $REMOTE)" "https://ntfy.sh/$TOPIC" >/dev/null 2>&1 || true
+            rm -f "$STOP_REASON_FILE" 2>/dev/null || true
+            exit 1
+        fi
+        sleep "$RETRY_DELAY"
+        continue
+    elif [[ $STATUS -eq 0 ]]; then
         ERROR_COUNT=0
         offline_start=""
         clear_stop_reason
