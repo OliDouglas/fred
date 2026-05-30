@@ -338,53 +338,12 @@ run_capture() {
 
 trap cleanup SIGINT SIGTERM
 
-for cmd in ffmpeg ffprobe yt-dlp curl rclone flock torsocks tor; do
+for cmd in ffmpeg ffprobe yt-dlp curl rclone flock torsocks; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "$(log_ts) ❌ ERROR: '$cmd' is not installed or not in PATH"
         exit 1
     fi
 done
-
-ensure_tor_running() {
-    if pgrep -x tor >/dev/null 2>&1; then
-        echo "$(log_ts) ✅ Tor process already running."
-        return 0
-    fi
-
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet tor; then
-        echo "$(log_ts) ✅ Tor service is active."
-        return 0
-    fi
-
-    if command -v systemctl >/dev/null 2>&1; then
-        echo "$(log_ts) 🔄 Attempting to start tor service via systemctl..."
-        if systemctl start tor 2>/dev/null; then
-            sleep 2
-            if pgrep -x tor >/dev/null 2>&1; then
-                echo "$(log_ts) ✅ Tor service started successfully."
-                return 0
-            fi
-        fi
-        echo "$(log_ts) ⚠️ Failed to start tor service via systemctl."
-    fi
-
-    echo "$(log_ts) 🔄 Launching tor in the background..."
-    tor -f /etc/tor/torrc >/tmp/tor_start.log 2>&1 &
-    TOR_BG_PID=$!
-
-    for i in {1..10}; do
-        if pgrep -x tor >/dev/null 2>&1; then
-            echo "$(log_ts) ✅ Tor started in the background."
-            return 0
-        fi
-        sleep 1
-    done
-
-    echo "$(log_ts) ❌ Tor failed to start in the background after 10 seconds. See /tmp/tor_start.log."
-    return 1
-}
-
-ensure_tor_running || exit 1
 
 if [[ $# -lt 1 ]]; then
     echo "$(log_ts) ❗ Usage: $0 <Chaturbate URL or model name>"
