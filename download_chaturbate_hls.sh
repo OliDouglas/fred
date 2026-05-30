@@ -159,6 +159,18 @@ probe_stream_status() {
             return 0
         fi
 
+        if echo "$CHECK_OUTPUT" | grep -q "Room is currently offline"; then
+            return 0
+        fi
+
+        if echo "$CHECK_OUTPUT" | grep -E -q "Room is currently in a private show|Performer is currently away|Hidden session in progress|Room is password protected"; then
+            return 0
+        fi
+
+        if echo "$CHECK_OUTPUT" | grep -q "HTTP Error 404"; then
+            return 0
+        fi
+
         tries=$((tries + 1))
         echo "$(log_ts) ⚠️ torsocks/yt-dlp probe failed (exit $STATUS), retry $tries/$GET_URL_MAX_TRIES..."
         printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
@@ -262,7 +274,7 @@ cleanup() {
         wait "$CAPTURE_PID" 2>/dev/null || true
     fi
 
-    if [[ -f "/tmp/ffmpeg.log" ]]; then
+    if [[ -f /tmp/ffmpeg.log ]]; then
         echo "$(log_ts) ℹ️ Last ffmpeg log lines:"
         tail -n 30 /tmp/ffmpeg.log | sed 's/^/    /'
     fi
@@ -443,24 +455,34 @@ while true; do
     echo "$(log_ts) 🔍 Checking stream status..."
     printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
 
-    if ! probe_stream_status; then
-        ERROR_COUNT=$((ERROR_COUNT + 1))
-        echo "$(log_ts) ⚠️ Torsocks/yt-dlp check failed after retries. (error attempt $ERROR_COUNT/${MAX_ERROR_RETRIES})"
-        printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
-        curl -s -d "$(log_ts) ⚠️ Torsocks connection or yt-dlp check failed for $URL (remote: $REMOTE) — attempt $ERROR_COUNT/${MAX_ERROR_RETRIES}" "https://ntfy.sh/$TOPIC" >/dev/null 2>&1 || true
-        if [[ "$ERROR_COUNT" -ge "$MAX_ERROR_RETRIES" ]]; then
-            echo "$(log_ts) ❌ Too many errors ($ERROR_COUNT). Stopping."
-            printf "\033[1;31m══════════════════════════════════════════════════════\033[0m\n"
-            echo "[DONE_SIGNAL]"
-            curl -s -d "$(log_ts) ❌ Stopped: Too many torsocks/yt-dlp errors ($ERROR_COUNT) for $URL (remote: $REMOTE)" "https://ntfy.sh/$TOPIC" >/dev/null 2>&1 || true
-            rm -f "$STOP_REASON_FILE" 2>/dev/null || true
-            exit 1
-        fi
-        sleep "$RETRY_DELAY"
-        continue
-    fi
+    probe_stream_status || true
 
-    if [[ $STATUS -eq 0 ]]; then
+    if echo "$CHECK_OUTPUT" | grep -q "Room is currently offline"; then
+        now=$SECONDS
+        if [[ -z "$offline_start" ]]; then
+            offline_start=$now
+            echo "$(log_ts) ⚠️ Model is offline — starting offline timer."
+            printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
+        else
+            elapsed=$(( now - offline_start ))
+            echo "$(log_ts) ⏳ Still offline for ${elapsed}s"
+            printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
+            if [[ "$elapsed" -ge "$OFFLINE_MAX_WAIT" ]]; then
+                printf "══════════════════════════════════════════════════════\n"
+                echo "$(log_ts) ❌ Offline too long (${OFFLINE_MAX_WAIT}s) — stopping."
+                printf "══════════════════════════════════════════════════════\n"
+                echo "[DONE_SIGNAL]"
+                curl -s -d "$(log_ts) ✳️💯❇️Stopped: Offline for $((OFFLINE_MAX_WAIT / 60)) min: $URL (remote: $REMOTE)" "https://ntfy.sh/$TOPIC" >/dev/null 2>&1 || true
+                rm -f "$STOP_REASON_FILE" 2>/dev/null || true
+                exit 0
+            fi
+        fi
+
+    elif echo "$CHECK_OUTPUT" | grep -E -q "Room is currently in a private show|Performer is currently away|Hidden session in progress|Room is password protected"; then
+        echo "$(log_ts) ⏸️ Private, away, hidden, or password-protected session — will keep retrying."
+        printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
+
+    elif [[ $STATUS -eq 0 ]]; then
         ERROR_COUNT=0
         offline_start=""
         clear_stop_reason
@@ -587,31 +609,6 @@ while true; do
 
         ERROR_COUNT=0
         offline_start=""
-
-    elif echo "$CHECK_OUTPUT" | grep -q "Room is currently offline"; then
-        now=$SECONDS
-        if [[ -z "$offline_start" ]]; then
-            offline_start=$now
-            echo "$(log_ts) ⚠️ Model is offline — starting offline timer."
-            printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
-        else
-            elapsed=$(( now - offline_start ))
-            echo "$(log_ts) ⏳ Still offline for ${elapsed}s"
-            printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
-            if [[ "$elapsed" -ge "$OFFLINE_MAX_WAIT" ]]; then
-                printf "══════════════════════════════════════════════════════\n"
-                echo "$(log_ts) ❌ Offline too long (${OFFLINE_MAX_WAIT}s) — stopping."
-                printf "══════════════════════════════════════════════════════\n"
-                echo "[DONE_SIGNAL]"
-                curl -s -d "$(log_ts) ✳️💯❇️Stopped: Offline for $((OFFLINE_MAX_WAIT / 60)) min: $URL (remote: $REMOTE)" "https://ntfy.sh/$TOPIC" >/dev/null 2>&1 || true
-                rm -f "$STOP_REASON_FILE" 2>/dev/null || true
-                exit 0
-            fi
-        fi
-
-    elif echo "$CHECK_OUTPUT" | grep -E -q "Room is currently in a private show|Performer is currently away|Hidden session in progress|Room is password protected"; then
-        echo "$(log_ts) ⏸️ Private, away, hidden, or password-protected session — will keep retrying."
-        printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
 
     elif echo "$CHECK_OUTPUT" | grep -q "HTTP Error 404"; then
         ERROR_COUNT=$((ERROR_COUNT + 1))
