@@ -142,6 +142,32 @@ get_stream_urls() {
     return 1
 }
 
+probe_stream_status() {
+    local tries=0
+    local output status
+
+    while (( tries < GET_URL_MAX_TRIES )); do
+        set +e
+        output=$(torsocks -i yt-dlp --simulate -f "$FORMAT" "$URL" 2>&1)
+        status=$?
+        set -e
+
+        CHECK_OUTPUT="$output"
+        STATUS="$status"
+
+        if (( STATUS == 0 )); then
+            return 0
+        fi
+
+        tries=$((tries + 1))
+        echo "$(log_ts) ⚠️ torsocks/yt-dlp probe failed (exit $STATUS), retry $tries/$GET_URL_MAX_TRIES..."
+        printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
+        sleep "$GET_URL_RETRY_DELAY"
+    done
+
+    return 1
+}
+
 watch_same_segment_runtime() {
     local current_file=""
     local current_since=0
@@ -262,7 +288,7 @@ cleanup() {
 run_capture() {
     local url_attempts=0
     local url_max_attempts=3
-    
+
     while (( url_attempts < url_max_attempts )); do
         if get_stream_urls; then
             break
@@ -417,12 +443,9 @@ while true; do
     echo "$(log_ts) 🔍 Checking stream status..."
     printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
 
-    CHECK_OUTPUT=$(torsocks -i yt-dlp --simulate -f "$FORMAT" "$URL" 2>&1)
-    STATUS=$?
-
-    if [[ $STATUS -ne 0 ]]; then
+    if ! probe_stream_status; then
         ERROR_COUNT=$((ERROR_COUNT + 1))
-        echo "$(log_ts) ⚠️ Torsocks/yt-dlp check failed (exit $STATUS). Retrying. (error attempt $ERROR_COUNT/${MAX_ERROR_RETRIES})"
+        echo "$(log_ts) ⚠️ Torsocks/yt-dlp check failed after retries. (error attempt $ERROR_COUNT/${MAX_ERROR_RETRIES})"
         printf "\033[1;33m══════════════════════════════════════════════════════\033[0m\n"
         curl -s -d "$(log_ts) ⚠️ Torsocks connection or yt-dlp check failed for $URL (remote: $REMOTE) — attempt $ERROR_COUNT/${MAX_ERROR_RETRIES}" "https://ntfy.sh/$TOPIC" >/dev/null 2>&1 || true
         if [[ "$ERROR_COUNT" -ge "$MAX_ERROR_RETRIES" ]]; then
@@ -435,7 +458,9 @@ while true; do
         fi
         sleep "$RETRY_DELAY"
         continue
-    elif [[ $STATUS -eq 0 ]]; then
+    fi
+
+    if [[ $STATUS -eq 0 ]]; then
         ERROR_COUNT=0
         offline_start=""
         clear_stop_reason
