@@ -23,6 +23,11 @@ SEGMENT_CHECK_INTERVAL=2
 SEGMENT_DIR="/tmp/stream_segments_$$"
 STOP_REASON_FILE=""
 
+TOR_SERVICE_NAME="${TOR_SERVICE_NAME:-tor}"
+TOR_SOCKS_HOST="${TOR_SOCKS_HOST:-127.0.0.1}"
+TOR_SOCKS_PORT="${TOR_SOCKS_PORT:-9050}"
+TOR_READY_MAX_WAIT="${TOR_READY_MAX_WAIT:-120}"
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 UPLOADER_FILE="$SCRIPT_DIR/uploader.txt"
 
@@ -37,6 +42,74 @@ fi
 
 log_ts() {
     TZ="Asia/Manila" date '+%Y-%m-%d %H:%M:%S'
+}
+
+tor_port_open() {
+    local host="$1"
+    local port="$2"
+
+    if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
+        exec 3>&- 3<&-
+        return 0
+    fi
+
+    return 1
+}
+
+ensure_tor_running() {
+    local waited=0
+    local tor_log="/tmp/tor_${MODEL:-session}.log"
+
+    if ! command -v tor >/dev/null 2>&1; then
+        echo "$(log_ts) ❌ tor is not installed"
+        exit 1
+    fi
+
+    if tor_port_open "$TOR_SOCKS_HOST" "$TOR_SOCKS_PORT"; then
+        echo "$(log_ts) ✅ Tor SOCKS proxy already reachable"
+        return 0
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet "$TOR_SERVICE_NAME" 2>/dev/null; then
+            echo "$(log_ts) ℹ️ Tor service already active"
+        else
+            echo "$(log_ts) ℹ️ Starting Tor via systemctl: $TOR_SERVICE_NAME"
+            sudo systemctl start "$TOR_SERVICE_NAME" >/dev/null 2>&1 || true
+        fi
+    elif command -v service >/dev/null 2>&1; then
+        echo "$(log_ts) ℹ️ Starting Tor via service: $TOR_SERVICE_NAME"
+        service "$TOR_SERVICE_NAME" start >/dev/null 2>&1 || true
+    fi
+
+    if ! tor_port_open "$TOR_SOCKS_HOST" "$TOR_SOCKS_PORT"; then
+        echo "$(log_ts) ℹ️ Starting Tor directly in background..."
+        nohup tor \
+            --SocksPort "${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}" \
+            --Log "notice file ${tor_log}" \
+            >/dev/null 2>&1 &
+    fi
+
+    echo "$(log_ts) 🔍 Waiting for Tor SOCKS proxy on ${TOR_SOCKS_HOST}:${TOR_SOCKS_PORT}..."
+
+    while (( waited < TOR_READY_MAX_WAIT )); do
+        if tor_port_open "$TOR_SOCKS_HOST" "$TOR_SOCKS_PORT"; then
+            if torsocks curl -fsS --max-time 10 https://check.torproject.org/api/ip >/dev/null 2>&1; then
+                echo "$(log_ts) ✅ Tor is running and reachable"
+                return 0
+            fi
+        fi
+
+        sleep 2
+        waited=$((waited + 2))
+    done
+
+    echo "$(log_ts) ❌ Tor did not become ready within ${TOR_READY_MAX_WAIT}s"
+    if [[ -f "$tor_log" ]]; then
+        echo "$(log_ts) ℹ️ Tor log tail:"
+        tail -n 30 "$tor_log" | sed 's/^/    /'
+    fi
+    exit 1
 }
 
 set_stop_reason() {
@@ -418,6 +491,8 @@ if ! flock -n 9; then
     echo "$(log_ts) ❌ Another instance is already running for $MODEL"
     exit 1
 fi
+
+ensure_tor_running
 
 STOP_REASON_FILE="/tmp/yt4_${MODEL}_stop_reason_$$"
 : > "$STOP_REASON_FILE" 2>/dev/null || true
