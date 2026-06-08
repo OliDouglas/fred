@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-scrape_followed_playwright.py
+live_followed_cb.py
 
 Requirements:
     pip install playwright
@@ -11,13 +11,13 @@ Requirements:
 Place your cookies.txt (Netscape format) in the same directory.
 
 Run:
-    python3 scrape_followed_playwright.py
+    python3 live_followed_cb.py
 
 Run tests:
-    python3 scrape_followed_playwright.py --test
+    python3 live_followed_cb.py --test
 
 Optional Tor proxy:
-    python3 scrape_followed_playwright.py --proxy socks5://127.0.0.1:9050
+    python3 live_followed_cb.py --proxy socks5://127.0.0.1:9050
 """
 
 from __future__ import annotations
@@ -42,8 +42,8 @@ COOKIES_TXT = "cookies.txt"
 OUT_HTML = "followed_playwright.html"
 OUT_TXT = "live_model.txt"
 WAIT_TIMEOUT_MS = 30_000
-LAUNCH_TIMEOUT_MS = 60_000
-LAUNCH_RETRIES = 3
+LAUNCH_TIMEOUT_MS = 30_000
+LAUNCH_RETRIES = 4
 LAUNCH_RETRY_DELAY_S = 3.0
 
 

@@ -7,7 +7,7 @@ set -euo pipefail
 OFFLINE_MAX_WAIT=600
 RETRY_DELAY=10
 TOPIC="yt-dlp-notify"
-FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
+FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
 BACKUP_REMOTES=(gd31 gd32 gd33 gd34 gd35)
 BASE_FOLDER="Streams"
 SEGMENT_TIME=60
@@ -636,8 +636,10 @@ while true; do
             wait "$SEGMENT_WATCHER_PID" 2>/dev/null || true
         fi
 
+        set +e
         wait "$CAPTURE_PID"
         CAPTURE_EXIT=$?
+        set -e
 
         stop_reason="$(get_stop_reason)"
         if [[ -z "$stop_reason" && "$CAPTURE_EXIT" -eq 8 ]]; then
